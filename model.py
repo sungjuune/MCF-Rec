@@ -33,7 +33,6 @@ class Recommender(nn.Module):
         self.density_mat = torch.FloatTensor(self.norm_dense(self.square_adjaceny.cpu())).to(self.device)
 
         self.DA = torch.matmul(self.density_mat, self.square_adjaceny)
-        #self.DAD = torch.matmul(self.DA, torch.FloatTensor(self.norm_dense(self.square_adjaceny.cpu())).to(self.device))
 
         self.initialize_features()
 

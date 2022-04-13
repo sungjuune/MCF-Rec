@@ -14,6 +14,7 @@ class Recommender(nn.Module):
         self.dim = args.dim
         self.layers = args.n_layers
         self.decay = args.decay
+        self.drop_rate = args.drop_out
         self.device = torch.device("cuda:"+str(args.gpu_id)) if args.cuda else torch.device("cpu")
 
         self.graph = G
@@ -21,39 +22,31 @@ class Recommender(nn.Module):
         self.n_users = self.graph.num_nodes(ntype='user')
         self.n_items = self.graph.num_nodes(ntype='item')
         
-        self.inter_adj = self.graph.adjacency_matrix(scipy_fmt='coo',).todense()
-        self.inter_adj = torch.FloatTensor(self.inter_adj)
-
-        self.square_adjaceny = torch.zeros(self.n_nodes, self.n_nodes)
-        self.square_adjaceny[:self.n_users, self.n_users:] = self.inter_adj
-        self.square_adjaceny[self.n_users:, :self.n_users] = self.inter_adj.T
-        self.square_adjaceny += torch.eye(self.n_nodes)
-        self.square_adjaceny = self.square_adjaceny.to(self.device)
-
-        self.density_mat = torch.FloatTensor(self.norm_dense(self.square_adjaceny.cpu())).to(self.device)
-
-        self.DA = torch.matmul(self.density_mat, self.square_adjaceny)
+        self.inter_mat = self.graph.adj(scipy_fmt='coo',)
+        self.norm_inter_mat = self.norm_dense(self.inter_mat)
+        self.norm_inter_mat = self.sp_mat_to_sp_tensor(self.norm_inter_mat).to(self.device)
 
         self.initialize_features()
 
+    def sp_mat_to_sp_tensor(self, X):
+        coo = X.tocoo()
+        i = torch.LongTensor([coo.row, coo.col])
+        v = torch.from_numpy(coo.data).float()
+        return torch.sparse.FloatTensor(i, v, coo.shape)
 
     def norm_dense(self, A):
         rowsum = np.array(A.sum(1))
-        d_inv = np.power(rowsum, -1)
+        d_inv = np.power(np.float32(rowsum), -1)
         d_inv[np.isinf(d_inv)] = 0.
-        d_mat_inv = ss.diags(d_inv).todense()
-        return d_mat_inv
+        d_mat_inv = ss.diags(d_inv.squeeze())
+        norm_inter_mat = d_mat_inv.dot(A)
+        return norm_inter_mat
 
     
     def initialize_features(self):
         init = nn.init.xavier_uniform_
-        self.graph.nodes['user'].data['cf_feature'] = init(torch.empty(self.graph.num_nodes(ntype='user'), self.dim))
-        self.graph.nodes['item'].data['cf_feature'] = init(torch.empty(self.graph.num_nodes(ntype='item'), self.dim))
-        user_feat = self.graph.nodes['user'].data['cf_feature']
-        item_feat = self.graph.nodes['item'].data['cf_feature']
-        
-        self.node_feat = torch.cat([user_feat, item_feat]).to(self.device)
-        self.node_feat = nn.Parameter(self.node_feat)
+        self.node_emb = init(torch.empty(self.n_nodes, self.dim).to(self.device))
+        self.node_emb = nn.Parameter(self.node_emb)
 
         self.train_weight = init(torch.empty(self.dim, self.dim)).to(self.device)
         self.train_weight = nn.Parameter(self.train_weight)
@@ -61,26 +54,44 @@ class Recommender(nn.Module):
         self.bias = init(torch.empty(self.n_nodes, self.dim)).to(self.device)
         self.bias = nn.Parameter(self.bias)
 
-    def graph_convolution(self, H):
-        result = torch.mm(torch.sparse.mm(self.DA, H), self.train_weight)
-        result = nn.LeakyReLU(negative_slope=0.2)(result + self.bias)
+    def sparse_dropout(self, x, drop_rate):
+        noise_shape = x._nnz()
+        random_tensor = 1 - drop_rate
+        random_tensor += torch.rand(noise_shape).to(x.device)
+        dropout_mask = torch.floor(random_tensor).type(torch.bool)
+        i = x._indices()
+        v = x._values()
 
-        return result
+        i = i[:, dropout_mask]
+        v = v[dropout_mask]
+
+        out = torch.sparse.FloatTensor(i, v, x.shape).to(x.device)
+        return out * (1. / (1 - drop_rate))
+
+    def graph_convolution(self, DA):
+        
+        user_emb = torch.mm(torch.sparse.mm(DA, self.node_emb[self.n_users: , :]), self.train_weight) + self.bias[:self.n_users]
+        item_emb = torch.mm(torch.sparse.mm(DA.t(), self.node_emb[:self.n_users , :]), self.train_weight) + self.bias[self.n_users:]
+
+        user_emb = F.normalize(nn.LeakyReLU(negative_slope=0.2)(user_emb), p=2, dim=1)
+        item_emb = F.normalize(nn.LeakyReLU(negative_slope=0.2)(item_emb), p=2, dim=1)
+
+        return torch.concat([user_emb, item_emb],0)
 
     def forward(self, batch=None, test=False):
         if test==False:    
             user = batch['batch_users']
             pos = batch['batch_pos']
             neg = batch['batch_neg']
-
-        H = self.node_feat
+        
+        #Interaction Dropout
+        DA = self.sparse_dropout(self.norm_inter_mat, self.drop_rate)
+        
         for layer in range(self.layers):
-            H = self.graph_convolution(H)
-            H = nn.Dropout(0.1)(H)
-            H = F.normalize(H, p=2, dim=1)
-
-        user_emb = H[:self.n_users]
-        item_emb = H[self.n_users:]
+            all_embedding = self.graph_convolution(DA)
+            
+        user_emb = all_embedding[:self.n_users, :]
+        item_emb = all_embedding[self.n_users:, :]
         loss = 0
 
         if test==False:
